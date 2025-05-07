@@ -25,6 +25,52 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to extract the main domain (e.g., example.com) from a URL or hostname
+# Handles schemes, paths, ports, and basic subdomains
+extract_main_domain() {
+    local input="$1"
+    local hostname_part
+    # Remove scheme (http://, https://, etc.)
+    hostname_part=$(echo "$input" | sed -E 's#^[^/]*://##')
+    # Remove path and query string (/path, ?query)
+    hostname_part=$(echo "$hostname_part" | sed -E 's#[/?].*##')
+    # Remove port (:8080)
+    hostname_part=$(echo "$hostname_part" | sed -E 's#:.*##')
+
+    # List of known multi-part TLDs (extend as needed)
+    local multi_part_tlds=("co.uk" "com.au" "co.nz" "co.jp" "org.uk" "me.uk" "net.uk" "ac.uk" "gov.uk" "org.au" "net.au" "id.au" "com.sg" "edu.sg" "gov.sg" "net.sg" "org.sg")
+    
+    # Try to match against known multi-part TLDs first
+    for tld in "${multi_part_tlds[@]}"; do
+        if [[ "$hostname_part" == *".$tld" ]]; then
+            # Extract part before the TLD using pattern matching
+            local domain_part="${hostname_part%.$tld}"
+            # If there are subdomains, get the last part before the TLD
+            if [[ "$domain_part" == *"."* ]]; then
+                domain_part="${domain_part##*.}"
+            fi
+            echo "$domain_part.$tld"
+            return
+        fi
+    done
+    
+    # Fall back to the original implementation for standard TLDs
+    # Extract main domain using awk (gets last two .-separated parts)
+    echo "$hostname_part" | awk -F. '{ if (NF >= 2) { print $(NF-1)"."$NF } else { print $0 } }'
+}
+
+# Function to get just the hostname part of a URL
+get_hostname_from_url() {
+    local url="$1"
+    # Remove scheme
+    local no_scheme="${url#*://}"
+    # Remove path, query, fragment
+    local hostname="${no_scheme%%/*}"
+    # Remove port
+    hostname="${hostname%%:*}"
+    echo "$hostname"
+}
+
 # Check if a string contains any of the help keywords AND none of the exclude keywords
 is_likely_help_candidate() {
     local input_str="${1,,}" # Convert to lowercase
@@ -95,15 +141,28 @@ fetch_and_count_urls() {
             mapfile -t subsitemaps < <(echo "$xmllint_output")
             echo "${indent}Found ${#subsitemaps[@]} sub-sitemaps."
             local success=0
+            local processed_count=0
             for sub in "${subsitemaps[@]}"; do
                 # Ensure sub-sitemap URL is absolute
                  if [[ ! "$sub" =~ ^https?:// ]]; then
                     local base_url=$(dirname "$sitemap_url")
                     sub="${base_url}/${sub}" # Basic relative path handling
                  fi
+
+                 # --- DOMAIN CHECK ADDED ---
+                 local sub_hostname=$(get_hostname_from_url "$sub")
+                 local sub_domain=$(extract_main_domain "$sub_hostname") # Extract base domain for comparison
+                 if [[ "$sub_domain" != "$main_domain" ]]; then
+                      echo "${indent}  Skipping sub-sitemap from different domain: $sub (domain: $sub_domain != main: $main_domain)"
+                      continue # Skip to the next sub-sitemap
+                 fi
+                 # --- END DOMAIN CHECK ---
+
                  echo "${indent}  DEBUG: Recursively calling fetch_and_count_urls with [$sub]"
                  fetch_and_count_urls "$sub" "  $indent" || success=1 # Recurse
+                 processed_count=$((processed_count + 1))
             done
+            echo "${indent}Processed $processed_count sub-sitemaps belonging to $main_domain."
             URL_COUNTS_BY_SITEMAP["$sitemap_url"]=0 # Index itself has 0 direct URLs
             return $success
         else
@@ -206,6 +265,7 @@ find_sitemap_at_base() {
             echo "       Checking: $potential_sitemap_url"
 
             local sitemap_curl_output
+            # Still use -L to follow redirects, but check the final URL
             sitemap_curl_output=$(curl -s -L --compressed -A "HelpCenterFinderBot/1.0" -w "%{http_code} %{url_effective}" -o /dev/null -m 10 "$potential_sitemap_url")
             local sitemap_curl_exit_code=$?
             local sitemap_http_status=$(echo "$sitemap_curl_output" | awk '{print $1}')
@@ -218,27 +278,48 @@ find_sitemap_at_base() {
 
             # Check if final status code is 200
             if [[ "$sitemap_http_status" == "200" ]]; then
-                 echo "       Found valid sitemap: $sitemap_effective_url (Status: $sitemap_http_status)"
-                 FINAL_SITEMAPS_TO_COUNT["$sitemap_effective_url"]=1
-                 return 0 # Successfully found one, exit function
+                 # --- DOMAIN CHECK ADDED ---
+                 local effective_hostname=$(get_hostname_from_url "$sitemap_effective_url")
+                 local effective_domain=$(extract_main_domain "$effective_hostname")
+                 if [[ "$effective_domain" == "$main_domain" ]]; then
+                    echo "       Found valid sitemap on correct domain: $sitemap_effective_url (Status: $sitemap_http_status)"
+                    FINAL_SITEMAPS_TO_COUNT["$sitemap_effective_url"]=1
+                    return 0 # Successfully found one matching domain, exit function
+                 else
+                    echo "       Found sitemap $sitemap_effective_url, but it's on a different domain ($effective_domain != $main_domain). Skipping."
+                    # Continue searching other sitemap_files for this search_base
+                 fi
+                 # --- END DOMAIN CHECK ---
             else
-                 echo "       Failed check for $potential_sitemap_url (Final Status: $sitemap_http_status)"
+                 echo "       Failed check for $potential_sitemap_url (Final Status: $sitemap_http_status, Effective URL: $sitemap_effective_url)"
             fi
         done
     done
 
-    echo "     No valid sitemap found for base URL $original_base_url or its effective directory."
-    return 1 # Failed to find any sitemap
+    echo "     No valid sitemap found *on domain $main_domain* for base URL $original_base_url or its effective directory."
+    return 1 # Failed to find any sitemap matching the domain
 }
 
 # --- Main Script ---
 
 # Input validation
 if [ -z "$1" ]; then
-    echo "Usage: $0 <domain.com>"
+    echo "Usage: $0 <domain.com | url>"
     echo "Example: $0 example.com"
+    echo "Example: $0 https://help.example.com/some/path"
     exit 1
 fi
+
+original_input="$1"
+main_domain=$(extract_main_domain "$original_input")
+
+if [[ -z "$main_domain" ]]; then
+    echo "Error: Could not extract a valid domain/hostname from input: $original_input"
+    exit 1
+fi
+
+echo "Original Input: $original_input"
+echo "Using Main Domain: $main_domain"
 
 # Check dependencies
 for cmd in curl jq host xmllint; do
@@ -249,50 +330,93 @@ for cmd in curl jq host xmllint; do
     fi
 done
 
-# Extract base domain (remove protocol, www., paths)
-DOMAIN=$(echo "$1" | sed -e 's|^[^/]*//||' -e 's/^www\.//' -e 's|/.*$||')
-echo "🔍 Identifying potential help centers for: $DOMAIN"
-
 # Use associative array for unique candidates
 declare -A CANDIDATES
 
-# 1. Query crt.sh for potential subdomains
-echo "[+] Querying crt.sh for subdomains..."
-crt_subdomains=$(curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' | sed -e 's/^\*\.//' -e 's/^CN=//' | grep -E "\\.$DOMAIN$" | grep -vE '@' | sort -u)
-for sub in $crt_subdomains; do
-    if is_likely_help_candidate "$sub"; then
-        echo "  [CRT] Found likely help subdomain: $sub"
-        CANDIDATES["subdomain:$sub"]=1
+# --- Domain Analysis ---
+echo -e "\\n--- Analyzing Domain: $main_domain ---"
+
+# 1. Check DNS TXT Record for _help_center_sitemap
+echo "[1/4] Checking DNS TXT record for _help_center_sitemap.$main_domain..."
+sitemap_from_txt=$(host -t TXT "_help_center_sitemap.$main_domain" | grep -o '".*"' | tr -d '"')
+
+if [ -n "$sitemap_from_txt" ]; then
+    echo "  Found sitemap via TXT record: $sitemap_from_txt"
+    FINAL_SITEMAPS_TO_COUNT["$sitemap_from_txt"]=1
+else
+    echo "  No TXT record found for _help_center_sitemap.$main_domain."
+fi
+
+# 2. Generate and Check Potential Help Center Subdomains/Paths
+echo -e "\\n[2/4] Checking common help subdomains and paths based on $main_domain..."
+declare -A potential_urls_map # Use map to avoid duplicates
+
+# Add the original input if it looks like a different, valid hostname/URL
+# (Simple check: contains a dot or is not the same as main_domain)
+if [[ "$original_input" != "$main_domain" ]] && [[ "$original_input" == *"."* ]]; then
+     # Attempt to normalize the original input to a base URL (e.g. https://sub.domain.com)
+     original_base_url=$(echo "$original_input" | sed -E 's#^([^/]*://)?([^/?#]+).*#https://\2#')
+     if [[ "$original_base_url" =~ ^https:// ]]; then
+         echo "  Adding original input base URL to checks: $original_base_url"
+         potential_urls_map["$original_base_url"]=1
+     fi
+fi
+
+
+# Generate URLs based on keywords and the main domain
+for keyword in "${HELP_KEYWORDS[@]}"; do
+    potential_urls_map["https://$keyword.$main_domain"]=1
+    potential_urls_map["https://$main_domain/$keyword"]=1
+done
+
+# Add www subdomain as a common case
+potential_urls_map["https://www.$main_domain"]=1
+
+# Check if potential URLs resolve and look for sitemaps
+checked_hosts_count=0
+found_via_common=false
+for url_base in "${!potential_urls_map[@]}"; do
+    # Extract hostname for DNS check
+    host_to_check=$(echo "$url_base" | sed -E 's#^https?://([^/]+).*#\1#')
+
+    echo "  Checking potential base: $url_base (Host: $host_to_check)"
+
+    # Check if hostname resolves before trying to find sitemap
+    if check_host_resolves "$host_to_check"; then
+        echo "    Host $host_to_check resolves."
+        checked_hosts_count=$((checked_hosts_count + 1))
+        # Now try finding a common sitemap file there
+        if find_sitemap_at_base "$url_base"; then
+             echo "    Found sitemap for $url_base"
+             found_via_common=true
+             # find_sitemap_at_base already adds to FINAL_SITEMAPS_TO_COUNT
+        else
+             echo "    No common sitemap found directly for $url_base"
+        fi
+    else
+        echo "    Host $host_to_check does not resolve. Skipping."
     fi
 done
 
-# 2. Check robots.txt for sitemaps
-echo "[+] Checking robots.txt..."
-for proto in https http; do
-    url="${proto}://${DOMAIN}/robots.txt"
-    robots_sitemaps=$(curl -s -L -m 5 -A "HelpCenterFinderBot/1.0" "$url" | grep -i '^Sitemap:' | awk '{print $2}')
-    for sm_url in $robots_sitemaps; do
-         # Clean potential carriage returns
-         sm_url=$(echo "$sm_url" | tr -d '\\r')
-         hostname=$(echo "$sm_url" | awk -F/ '{print $3}')
-         path=$(echo "$sm_url" | awk -F/ '{ $1=$2=$3=""; print $0 }' | sed 's/^ *//') # Get path part
-        if is_likely_help_candidate "$hostname" || is_likely_help_candidate "$path"; then
-             echo "  [Robots] Found likely help sitemap: $sm_url"
-            CANDIDATES["sitemap:$sm_url"]=1
-        fi
-    done
-done
+if [[ "$checked_hosts_count" -eq 0 ]]; then
+     echo "  Warning: None of the generated potential hostnames resolved."
+elif [[ "$found_via_common" = false ]]; then
+     echo "  Checked $checked_hosts_count resolving hosts, but found no sitemaps via common file names (sitemap.xml, sitemap_index.xml)."
+fi
 
-# 3. Check common sitemap paths on main domain
-echo "[+] Checking common sitemap paths on $DOMAIN..."
-for path in "${COMMON_SITEMAP_FILES[@]}"; do
-   potential_url="https://${DOMAIN}/$path"
-    # Check header
-    if curl -s -L --compressed -I -m 5 -A "HelpCenterFinderBot/1.0" "$potential_url" | grep -q "HTTP/[12][.][01] 200"; then
-        if is_likely_help_candidate "$potential_url"; then
-             echo "  [Common Path] Found likely help sitemap: $potential_url"
-            CANDIDATES["sitemap:$potential_url"]=1
-        fi
+
+# 3. Search robots.txt for Sitemap Directives
+echo -e "\\n[3/4] Searching robots.txt on https://$main_domain/robots.txt..."
+robots_url="https://$main_domain/robots.txt"
+robots_sitemaps=$(curl -s -L -m 5 -A "HelpCenterFinderBot/1.0" "$robots_url" | grep -i '^Sitemap:' | awk '{print $2}')
+for sm_url in $robots_sitemaps; do
+     # Clean potential carriage returns
+     sm_url=$(echo "$sm_url" | tr -d '\\r')
+     hostname=$(echo "$sm_url" | awk -F/ '{print $3}')
+     path=$(echo "$sm_url" | awk -F/ '{ $1=$2=$3=""; print $0 }' | sed 's/^ *//') # Get path part
+    if is_likely_help_candidate "$hostname" || is_likely_help_candidate "$path"; then
+         echo "  [Robots] Found likely help sitemap: $sm_url"
+        CANDIDATES["sitemap:$sm_url"]=1
     fi
 done
 
@@ -301,7 +425,7 @@ done
 COMMON_HELP_SUBDOMAINS=("help" "support" "docs" "guide" "guides" "knowledge" "faq" "knowledgebase")
 echo "[+] Checking common help subdomains..."
 for sub_prefix in "${COMMON_HELP_SUBDOMAINS[@]}"; do
-    subdomain="$sub_prefix.$DOMAIN"
+    subdomain="$sub_prefix.$main_domain"
     if check_host_resolves "$subdomain"; then
         if is_likely_help_candidate "$subdomain"; then
              echo "  [Common Subdomain] Found likely help subdomain: $subdomain"
@@ -413,7 +537,7 @@ for sitemap in "${!FINAL_SITEMAPS_TO_COUNT[@]}"; do
 done
 
 # --- Final Output ---
-echo -e "\n--- Summary ---"
+echo -e "\\n--- Summary for $main_domain ---"
 echo "📦 URLs Counted per Sitemap:"
 processed_count=0
 failed_count=0

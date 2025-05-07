@@ -8,18 +8,25 @@
 declare -A sitemap_counts
 total_urls=0
 
+# Define a browser-like user agent
+BROWSER_USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+
 function fetch_and_count() {
     local sitemap_url="$1"
     local indent="$2"
 
     echo "${indent}Fetching: $sitemap_url"
 
-    # Fetch content with L flag to follow redirects
-    content=$(curl -s -L "$sitemap_url")
+    # Fetch content with L flag to follow redirects and use browser-like user agent
+    content=$(curl -s -L -A "$BROWSER_USER_AGENT" "$sitemap_url")
     if [[ -z "$content" ]]; then
         echo "${indent}Error: Failed to fetch $sitemap_url or content is empty."
         return 1 # Indicate failure
     fi
+
+    # Save the first 20 lines for debugging
+    echo "${indent}First 20 lines of content:"
+    echo "$content" | head -n 20 | sed "s/^/${indent}  /"
 
     # Check if it's a sitemapindex (case-insensitive)
     if echo "$content" | grep -iq "<sitemapindex"; then
