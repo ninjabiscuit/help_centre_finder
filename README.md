@@ -11,6 +11,7 @@ This repository contains several specialized scripts for web discovery tasks:
 - **crawl_website.sh**: Crawl a website and count the number of pages within a domain
 - **sitemap_finder.sh**: Find sitemaps for a website through various discovery methods
 - **find_subdomains.sh**: Discover subdomains using multiple techniques
+- **hybrid_cms_analyzer.sh**: Analyze CSV files to detect CMS platforms and bot protection across URLs
 
 ## Requirements
 
@@ -19,6 +20,7 @@ This repository contains several specialized scripts for web discovery tasks:
 - Additional tools:
   - `jq`: For JSON processing
   - `xmllint`: For parsing XML (part of libxml2)
+  - `python3`: For CSV processing and formatting (CMS analysis)
   - `host`: For DNS lookups
   - `fzf` (optional): For interactive selection
 
@@ -139,6 +141,60 @@ Crawl a website:
 ```bash
 ./crawl_website.sh https://support.google.com/mail
 ```
+
+Analyze CMS platforms in a CSV file:
+```bash
+./hybrid_cms_analyzer.sh "input.csv" "output.csv"
+```
+
+## CMS Analysis
+
+The `hybrid_cms_analyzer.sh` script provides comprehensive CMS detection and analysis for CSV files containing URLs.
+
+**CSV Format Requirements:**
+- Must have a header row
+- URLs must be in column D (4th column) with header name `IMPORT_SOURCE_URL`
+- Other columns can be anything - only column D is used for analysis
+- CSV should be properly formatted (quoted fields containing commas)
+
+**Example CSV structure:**
+```csv
+APP_ID,CUSTOMER_NAME,SUPPORT_SEGMENT,IMPORT_SOURCE_URL,CREATED_AT
+1234,"Company Name",High Volume,https://example.com/help,2025-01-01
+5678,"Another Co",Medium,https://support.test.com,2025-01-02
+```
+
+**Features:**
+- Detects 20+ CMS platforms (WordPress, Salesforce, Shopify, Zendesk, etc.)
+- Captures complete HTTP headers (1000 characters) 
+- Identifies bot protection mechanisms
+- Provides confidence scoring with evidence
+- Adds new columns: CMS_HEADERS, BOT_PROTECTION, CMS, CMS_CONFIDENCE, CMS_EVIDENCE
+
+**Supported CMS Platforms:**
+- WordPress, Drupal, Joomla
+- Salesforce, Zendesk, Intercom 
+- Shopify, Magento
+- Notion, ReadMe.io, Ghost
+- React, Angular, Vue.js apps
+- Express, Django, Laravel frameworks
+- And many more...
+
+**Usage:**
+```bash
+# Basic analysis (requires URLs in column D)
+./hybrid_cms_analyzer.sh "urls.csv" "results.csv"
+
+# Fix CSV formatting if output has issues
+python3 fix_csv_format.py
+```
+
+**Output:**
+- Main results file with original data + 5 new CMS columns
+- Review file for low-confidence detections  
+- Detailed processing logs
+
+For complete instructions, see [CMS_ANALYSIS_GUIDE.md](CMS_ANALYSIS_GUIDE.md).
 
 ## Domain Processing
 
